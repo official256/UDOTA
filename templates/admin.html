@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Admin Portal | Udota</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <style>
+        :root { --primary: #6366f1; --bg: #f8fafc; --danger: #ef4444; }
+        body { font-family: 'Plus Jakarta Sans', sans-serif; background: var(--bg); margin: 0; padding: 20px; color: #1e293b; }
+        .admin-grid { display: grid; grid-template-columns: 1fr 380px; gap: 20px; max-width: 1400px; margin: auto; }
+        .panel { background: white; padding: 25px; border-radius: 16px; border: 1px solid #e2e8f0; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }
+        #admin-map { height: 500px; border-radius: 12px; margin-top: 10px; border: 1px solid #cbd5e1; z-index: 1; }
+        .btn { background: var(--primary); color: white; border: none; padding: 12px 20px; border-radius: 10px; cursor: pointer; font-weight: 700; transition: opacity 0.2s; }
+        .btn:hover { opacity: 0.9; }
+        .stat-card { background: #f1f5f9; padding: 20px; border-radius: 14px; margin-bottom: 15px; border: 1px solid #e2e8f0; }
+        .badge { padding: 4px 8px; border-radius: 6px; font-weight: 800; text-transform: uppercase; }
+        
+        /* Activity Log Styling */
+        #activity-log { 
+            height: 250px; overflow-y: auto; background: #0f172a; color: #38bdf8; 
+            padding: 15px; font-family: 'Courier New', monospace; font-size: 0.8rem; 
+            border-radius: 10px; line-height: 1.6;
+        }
+        .log-entry { border-bottom: 1px solid #1e293b; padding: 4px 0; }
+    </style>
+</head>
+<body>
+    <div style="display: flex; justify-content: space-between; align-items: center; max-width: 1400px; margin: 0 auto 25px auto;">
+        <div>
+            <h1 style="margin:0; letter-spacing: -1px;">🛡️ Control Center</h1>
+            <p style="color: #64748b; margin: 5px 0 0 0;">System-wide surveillance and user management</p>
+        </div>
+        <a href="/" style="text-decoration: none; font-weight: 700; color: var(--primary); background: #eef2ff; padding: 10px 20px; border-radius: 10px;">← Dashboard</a>
+    </div>
+
+    <div class="admin-grid">
+        <div class="panel">
+            <h3 style="margin-top:0;">Global Surveillance Map</h3>
+            <div id="admin-map"></div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 20px;">
+            <div class="panel">
+                <h3 style="margin-top:0;">Live Activity</h3>
+                <div id="activity-log">
+                    <div class="log-entry">> System online. Ready for broadcast.</div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3 style="margin-top:0;">Announcements</h3>
+                <form action="/admin/announce" method="POST" style="display: flex; flex-direction: column; gap: 10px;">
+                    <input type="text" name="announcement" placeholder="Message to all users..." required 
+                           style="padding: 12px; border: 1px solid #ddd; border-radius: 8px; font-family: inherit;">
+                    <button type="submit" class="btn" style="background: #f59e0b;">Broadcast Alert</button>
+                </form>
+            </div>
+        </div>
+
+        <div class="panel" style="grid-column: span 2;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                <h3 style="margin:0;">User Management</h3>
+                <div class="badge" style="background: #eef2ff; color: var(--primary);">
+                    Total Users: <span id="total-users">0</span>
+                </div>
+            </div>
+            <table style="width: 100%; border-collapse: collapse;">
+                <thead>
+                    <tr style="text-align: left; color: #64748b; font-size: 0.8rem; border-bottom: 1px solid #e2e8f0;">
+                        <th style="padding: 12px;">USERNAME</th>
+                        <th>POINTS</th>
+                        <th>STATUS</th>
+                        <th style="text-align: right;">ACTIONS</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for user in users %}
+                    <tr style="border-bottom: 1px solid #f1f5f9; transition: background 0.2s;">
+                        <td style="padding: 15px 12px;">
+                            <span style="font-weight: 700;">{{ user.username }}</span>
+                            {% if user.is_admin %}<span class="badge" style="background: #eef2ff; color: var(--primary); font-size: 0.6rem; margin-left: 8px;">Staff</span>{% endif %}
+                        </td>
+                        <td><span style="font-weight: 600;">{{ user.points }}</span></td>
+                        <td>
+                            {% if user.is_banned %}
+                                <span style="color: var(--danger); font-weight: 800; font-size: 0.8rem;">● BANNED</span>
+                            {% else %}
+                                <span style="color: #22c55e; font-weight: 800; font-size: 0.8rem;">● ACTIVE</span>
+                            {% endif %}
+                        </td>
+                        <td style="text-align: right;">
+                            <a href="/admin/reset_points/{{ user.id }}" style="color: var(--primary); text-decoration: none; font-weight: 600; font-size: 0.8rem; margin-right: 15px;">Reset Pts</a>
+                            <a href="/admin/toggle_ban/{{ user.id }}" style="color: var(--danger); text-decoration: none; font-weight: 600; font-size: 0.8rem;">
+                                {{ "Unban" if user.is_banned else "Ban User" }}
+                            </a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        const CURRENT_USERNAME = "{{ current_user.username }}";
+        const IS_ADMIN = true;
+        const socket = io();
+
+        // Socket listener for Activity Log
+        socket.on('admin_log', (data) => {
+            const log = document.getElementById('activity-log');
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.innerHTML = `<span style="color: #64748b;">[${new Date().toLocaleTimeString()}]</span> ${data.msg}`;
+            log.prepend(entry);
+        });
+
+        // Update Counter
+        fetch('/get_members').then(r => r.json()).then(m => {
+            document.getElementById('total-users').innerText = m.length;
+        });
+    </script>
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
