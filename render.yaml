@@ -1,7 +1,58 @@
+# render.yaml
+# Blueprint for Udota Flask Application
+
 services:
   - type: web
-    name: flask-app-service
-    runtime: python
+    name: udota-app
+    env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    region: oregon  # or singapore, frankfurt, ohio, etc.
+    
+    # Build configuration
+    buildCommand: |
+      pip install -r requirements.txt
+      python -c "from app import app, db; app.app_context().push(); db.create_all(); print('Database initialized')"
+    
+    # Start command
+    startCommand: gunicorn --worker-class eventlet -w 1 --bind 0.0.0.0:$PORT app:app
+    
+    # Health check path
+    healthCheckPath: /
+    
+    # Environment variables
+    envVars:
+      - key: FLASK_ENV
+        value: production
+      - key: FLASK_DEBUG
+        value: false
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: DATABASE_URL
+        fromDatabase:
+          name: udota-db
+          property: connectionString
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DEFAULT_ADMIN_USERNAME
+        value: admin
+      - key: DEFAULT_ADMIN_PASSWORD
+        generateValue: true
+    
+    # Auto-deploy from GitHub (optional)
+    autoDeploy: true
+    
+    # CORS settings
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /
+    
+    # Advanced settings
+    dockerContext: .
+    dockerfilePath: ./Dockerfile  # If using Docker
+
+databases:
+  - name: udota-db
+    plan: free
+    databaseName: udota
+    region: oregon
