@@ -28,7 +28,7 @@ app.config.update(
         'pool_recycle': 280,
         'pool_pre_ping': True,
     },
-    SESSION_COOKIE_SECURE=False,  # Set to True in production with HTTPS
+    SESSION_COOKIE_SECURE=os.environ.get('FLASK_ENV') == 'production',
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE='Lax',
     PERMANENT_SESSION_LIFETIME=datetime.timedelta(days=7),
@@ -67,6 +67,8 @@ if not app.debug:
 
 # --- Models ---
 class User(UserMixin, db.Model):
+    __tablename__ = 'user'
+    
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(150), unique=True, nullable=False, index=True)
     email = db.Column(db.String(150), unique=True, nullable=True)
@@ -83,7 +85,7 @@ class User(UserMixin, db.Model):
     status_message = db.Column(db.String(200), default='')
     
     # Relationships
-    messages = db.relationship('Message', backref='author', lazy='dynamic')
+    messages = db.relationship('Message', backref='author', lazy='dynamic', foreign_keys='Message.user_id')
     
     def to_dict(self):
         return {
@@ -99,6 +101,8 @@ class User(UserMixin, db.Model):
         }
 
 class Video(db.Model):
+    __tablename__ = 'video'
+    
     id = db.Column(db.Integer, primary_key=True)
     title = db.Column(db.String(200), nullable=False)
     url = db.Column(db.String(500), nullable=False)
@@ -118,6 +122,8 @@ class Video(db.Model):
         }
 
 class Message(db.Model):
+    __tablename__ = 'message'
+    
     id = db.Column(db.Integer, primary_key=True)
     content = db.Column(db.Text, nullable=False)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
@@ -127,6 +133,8 @@ class Message(db.Model):
     timestamp = db.Column(db.DateTime, default=datetime.datetime.utcnow, index=True)
 
 class AdminLog(db.Model):
+    __tablename__ = 'admin_log'
+    
     id = db.Column(db.Integer, primary_key=True)
     action = db.Column(db.String(200), nullable=False)
     admin_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
@@ -146,7 +154,7 @@ def admin_required(f):
 
 def log_admin_action(action, target=None, details=None):
     """Log admin actions for audit trail"""
-    if current_user.is_admin:
+    if current_user.is_authenticated and current_user.is_admin:
         log = AdminLog(
             action=action,
             admin_id=current_user.id,
@@ -166,12 +174,12 @@ def update_last_seen():
         current_user.last_seen = datetime.datetime.utcnow()
         db.session.commit()
 
-# --- Initialize Database ---
-@app.before_first_request
+# --- Database Initialization Function ---
 def initialize_database():
-    """Initialize database tables before first request"""
+    """Initialize database tables"""
     with app.app_context():
         try:
+            # Create all tables
             db.create_all()
             app.logger.info("Database tables created successfully")
             
@@ -195,6 +203,9 @@ def initialize_database():
         except Exception as e:
             app.logger.error(f"Error initializing database: {e}")
             raise
+
+# --- Initialize database on startup ---
+initialize_database()
 
 # --- Authentication Routes ---
 @app.route('/signup', methods=['GET', 'POST'])
@@ -885,13 +896,12 @@ def internal_error(error):
 def forbidden_error(error):
     return render_template('403.html'), 403
 
-# --- Database initialization ---
+# --- Database initialization command ---
 @app.cli.command('init-db')
 def init_db_command():
     """Initialize the database."""
-    with app.app_context():
-        db.create_all()
-        print('Database initialized.')
+    initialize_database()
+    print('Database initialized.')
 
 @app.cli.command('create-admin')
 def create_admin():
@@ -918,14 +928,6 @@ def create_admin():
 
 # --- Main entry point ---
 if __name__ == '__main__':
-    # Create database tables if they don't exist
-    with app.app_context():
-        try:
-            db.create_all()
-            print("Database tables created/verified")
-        except Exception as e:
-            print(f"Error creating database: {e}")
-    
     # Run the application
     socketio.run(app, 
                  debug=os.environ.get('FLASK_DEBUG', 'False').lower() == 'true',
