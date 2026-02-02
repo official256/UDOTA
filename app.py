@@ -4,6 +4,7 @@ eventlet.monkey_patch()
 import datetime
 import os
 import secrets
+import urllib.parse as urlparse
 from functools import wraps
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, session
 from flask_sqlalchemy import SQLAlchemy
@@ -11,23 +12,44 @@ from flask_login import LoginManager, UserMixin, login_user, current_user, login
 from flask_socketio import SocketIO, emit, join_room, leave_room, disconnect
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
-from sqlalchemy import func, desc
+from sqlalchemy import func, desc, text
 import logging
 from logging.handlers import RotatingFileHandler
 
 # Create Flask app
 app = Flask(__name__)
 
+# --- Database URL Configuration ---
+# Handle PostgreSQL URL format from Render/Heroku
+def get_database_url():
+    database_url = os.environ.get('DATABASE_URL')
+    
+    if not database_url:
+        # Default to SQLite for local development
+        return 'sqlite:///database.db'
+    
+    # If it's already a PostgreSQL URL with postgresql:// prefix
+    if database_url.startswith('postgresql://'):
+        return database_url
+    
+    # Convert postgres:// to postgresql:// (for compatibility with SQLAlchemy 1.4+)
+    if database_url.startswith('postgres://'):
+        database_url = database_url.replace('postgres://', 'postgresql://', 1)
+    
+    return database_url
+
 # --- Configuration ---
-# Use environment variables for production security
 app.config.update(
     SECRET_KEY=os.environ.get('SECRET_KEY', 'dev_key_change_in_production_' + secrets.token_hex(16)),
-    SQLALCHEMY_DATABASE_URI=os.environ.get('DATABASE_URL', 'sqlite:///database.db'),
+    SQLALCHEMY_DATABASE_URI=get_database_url(),
     SQLALCHEMY_TRACK_MODIFICATIONS=False,
     SQLALCHEMY_ENGINE_OPTIONS={
         'pool_recycle': 280,
         'pool_pre_ping': True,
-    },
+        'pool_size': 10,
+        'max_overflow': 20,
+        'pool_timeout': 30,
+    } if os.environ.get('DATABASE_URL') else {},  # Only use connection pooling for PostgreSQL
     SESSION_COOKIE_SECURE=os.environ.get('FLASK_ENV') == 'production',
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE='Lax',
@@ -65,9 +87,14 @@ if not app.debug:
     app.logger.setLevel(logging.INFO)
     app.logger.info('Udota startup')
 
+# Log database info
+database_url = app.config['SQLALCHEMY_DATABASE_URI']
+app.logger.info(f"Database URL: {database_url[:50]}...")
+app.logger.info(f"Using PostgreSQL: {'postgresql' in database_url}")
+
 # --- Models ---
 class User(UserMixin, db.Model):
-    __tablename__ = 'user'
+    __tablename__ = 'users'  # Changed from 'user' to avoid SQL keyword conflicts
     
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(150), unique=True, nullable=False, index=True)
@@ -85,7 +112,10 @@ class User(UserMixin, db.Model):
     status_message = db.Column(db.String(200), default='')
     
     # Relationships
-    messages = db.relationship('Message', backref='author', lazy='dynamic', foreign_keys='Message.user_id')
+    messages_sent = db.relationship('Message', backref='author', lazy='dynamic', 
+                                   foreign_keys='Message.user_id')
+    messages_received = db.relationship('Message', backref='recipient', lazy='dynamic',
+                                       foreign_keys='Message.recipient_id')
     
     def to_dict(self):
         return {
@@ -101,13 +131,13 @@ class User(UserMixin, db.Model):
         }
 
 class Video(db.Model):
-    __tablename__ = 'video'
+    __tablename__ = 'videos'
     
     id = db.Column(db.Integer, primary_key=True)
     title = db.Column(db.String(200), nullable=False)
     url = db.Column(db.String(500), nullable=False)
     description = db.Column(db.Text, default='')
-    added_by = db.Column(db.Integer, db.ForeignKey('user.id'))
+    added_by = db.Column(db.Integer, db.ForeignKey('users.id'))
     added_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
     duration = db.Column(db.Integer, default=0)  # in seconds
     is_active = db.Column(db.Boolean, default=True)
@@ -122,23 +152,23 @@ class Video(db.Model):
         }
 
 class Message(db.Model):
-    __tablename__ = 'message'
+    __tablename__ = 'messages'
     
     id = db.Column(db.Integer, primary_key=True)
     content = db.Column(db.Text, nullable=False)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     room = db.Column(db.String(100), default='global')
     is_private = db.Column(db.Boolean, default=False)
-    recipient_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    recipient_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     timestamp = db.Column(db.DateTime, default=datetime.datetime.utcnow, index=True)
 
 class AdminLog(db.Model):
-    __tablename__ = 'admin_log'
+    __tablename__ = 'admin_logs'
     
     id = db.Column(db.Integer, primary_key=True)
     action = db.Column(db.String(200), nullable=False)
-    admin_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    target_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    admin_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    target_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     details = db.Column(db.Text)
     timestamp = db.Column(db.DateTime, default=datetime.datetime.utcnow)
 
@@ -179,6 +209,10 @@ def initialize_database():
     """Initialize database tables"""
     with app.app_context():
         try:
+            # Test database connection
+            db.session.execute(text('SELECT 1'))
+            app.logger.info("Database connection successful")
+            
             # Create all tables
             db.create_all()
             app.logger.info("Database tables created successfully")
@@ -199,10 +233,27 @@ def initialize_database():
                 db.session.add(admin_user)
                 db.session.commit()
                 app.logger.info("Default admin user created")
+            
+            # Create indexes for better performance
+            if 'postgresql' in app.config['SQLALCHEMY_DATABASE_URI']:
+                # Create additional indexes for PostgreSQL
+                try:
+                    db.session.execute(text('CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages (timestamp DESC)'))
+                    db.session.execute(text('CREATE INDEX IF NOT EXISTS idx_users_online ON users (is_online) WHERE is_online = true'))
+                    db.session.commit()
+                    app.logger.info("PostgreSQL indexes created")
+                except Exception as e:
+                    app.logger.warning(f"Could not create indexes: {e}")
                 
         except Exception as e:
             app.logger.error(f"Error initializing database: {e}")
-            raise
+            # Try to create tables anyway (in case it's a new database)
+            try:
+                db.create_all()
+                app.logger.info("Database tables created on retry")
+            except Exception as e2:
+                app.logger.error(f"Failed to create tables: {e2}")
+                raise
 
 # --- Initialize database on startup ---
 initialize_database()
@@ -231,7 +282,7 @@ def signup():
             flash('Password must be at least 8 characters long.', 'error')
             return redirect(url_for('signup'))
         
-        # Check if username exists
+        # Check if username exists (case-insensitive)
         if User.query.filter(func.lower(User.username) == func.lower(username)).first():
             flash('Username already exists.', 'error')
             return redirect(url_for('signup'))
@@ -254,8 +305,14 @@ def signup():
             last_login=datetime.datetime.utcnow()
         )
         
-        db.session.add(new_user)
-        db.session.commit()
+        try:
+            db.session.add(new_user)
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            app.logger.error(f"Error creating user: {e}")
+            flash('Error creating account. Please try again.', 'error')
+            return redirect(url_for('signup'))
         
         # Log the signup
         if not is_first_user:
@@ -295,7 +352,14 @@ def login():
             # Update user status
             user.is_online = True
             user.last_login = datetime.datetime.utcnow()
-            db.session.commit()
+            
+            try:
+                db.session.commit()
+            except Exception as e:
+                db.session.rollback()
+                app.logger.error(f"Error updating user status: {e}")
+                flash('Database error. Please try again.', 'error')
+                return redirect(url_for('login'))
             
             # Log the login
             login_user(user, remember=remember)
@@ -327,7 +391,12 @@ def login():
 def logout():
     # Update user status
     current_user.is_online = False
-    db.session.commit()
+    
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error updating logout status: {e}")
     
     # Notify about logout
     socketio.emit('user_status', {
@@ -346,38 +415,54 @@ def logout():
 @login_required
 def index():
     """Main dashboard"""
-    # Get online users count
-    online_count = User.query.filter_by(is_online=True).count()
-    
-    # Get latest video
-    latest_video = Video.query.filter_by(is_active=True).order_by(Video.added_at.desc()).first()
-    
-    # Get leaderboard (top 10)
-    leaderboard = User.query.filter_by(is_banned=False).order_by(desc(User.points)).limit(10).all()
-    
-    return render_template('index.html',
-                         latest_video=latest_video,
-                         online_count=online_count,
-                         leaderboard=leaderboard)
+    try:
+        # Get online users count
+        online_count = User.query.filter_by(is_online=True).count()
+        
+        # Get latest video
+        latest_video = Video.query.filter_by(is_active=True).order_by(Video.added_at.desc()).first()
+        
+        # Get leaderboard (top 10)
+        leaderboard = User.query.filter_by(is_banned=False).order_by(desc(User.points)).limit(10).all()
+        
+        return render_template('index.html',
+                             latest_video=latest_video,
+                             online_count=online_count,
+                             leaderboard=leaderboard)
+    except Exception as e:
+        app.logger.error(f"Error loading dashboard: {e}")
+        flash('Error loading dashboard. Please try again.', 'error')
+        return render_template('index.html',
+                             latest_video=None,
+                             online_count=0,
+                             leaderboard=[])
 
 @app.route('/api/members/locations')
 @login_required
 def get_members():
     """Get all members with their locations"""
-    users = User.query.filter_by(is_banned=False).all()
-    return jsonify([user.to_dict() for user in users])
+    try:
+        users = User.query.filter_by(is_banned=False).all()
+        return jsonify([user.to_dict() for user in users])
+    except Exception as e:
+        app.logger.error(f"Error getting members: {e}")
+        return jsonify([]), 500
 
 @app.route('/api/leaderboard')
 @login_required
 def get_leaderboard():
     """Get leaderboard data"""
-    users = User.query.filter_by(is_banned=False).order_by(desc(User.points)).limit(20).all()
-    return jsonify([{
-        'username': u.username,
-        'points': u.points,
-        'rank': i + 1,
-        'is_current_user': u.id == current_user.id
-    } for i, u in enumerate(users)])
+    try:
+        users = User.query.filter_by(is_banned=False).order_by(desc(User.points)).limit(20).all()
+        return jsonify([{
+            'username': u.username,
+            'points': u.points,
+            'rank': i + 1,
+            'is_current_user': u.id == current_user.id
+        } for i, u in enumerate(users)])
+    except Exception as e:
+        app.logger.error(f"Error getting leaderboard: {e}")
+        return jsonify([]), 500
 
 @app.route('/api/profile/update', methods=['POST'])
 @login_required
@@ -385,18 +470,23 @@ def update_profile():
     """Update user profile"""
     data = request.get_json()
     
-    if 'status_message' in data:
-        current_user.status_message = data['status_message'][:200]
-    
-    if 'email' in data:
-        email = data['email'].strip().lower()
-        if email and email != current_user.email:
-            if User.query.filter_by(email=email).first():
-                return jsonify({'error': 'Email already in use'}), 400
-            current_user.email = email
-    
-    db.session.commit()
-    return jsonify({'message': 'Profile updated', 'user': current_user.to_dict()})
+    try:
+        if 'status_message' in data:
+            current_user.status_message = data['status_message'][:200]
+        
+        if 'email' in data:
+            email = data['email'].strip().lower()
+            if email and email != current_user.email:
+                if User.query.filter_by(email=email).first():
+                    return jsonify({'error': 'Email already in use'}), 400
+                current_user.email = email
+        
+        db.session.commit()
+        return jsonify({'message': 'Profile updated', 'user': current_user.to_dict()})
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error updating profile: {e}")
+        return jsonify({'error': 'Database error'}), 500
 
 @app.route('/api/reward', methods=['POST'])
 @login_required
@@ -417,7 +507,13 @@ def reward_user():
         
         # Award points
         current_user.points += points_earned
-        db.session.commit()
+        
+        try:
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            app.logger.error(f"Error awarding points: {e}")
+            return jsonify({'error': 'Database error'}), 500
         
         # Log the reward
         log_admin_action(
@@ -506,29 +602,41 @@ def generate_agora_token():
 @admin_required
 def admin_portal():
     """Admin dashboard"""
-    # Statistics
-    total_users = User.query.count()
-    online_users = User.query.filter_by(is_online=True).count()
-    banned_users = User.query.filter_by(is_banned=True).count()
-    total_points = db.session.query(func.sum(User.points)).scalar() or 0
-    
-    # Recent videos
-    recent_videos = Video.query.order_by(desc(Video.added_at)).limit(10).all()
-    
-    # Recent logs
-    recent_logs = AdminLog.query.order_by(desc(AdminLog.timestamp)).limit(20).all()
-    
-    # All users for management
-    users = User.query.order_by(desc(User.created_at)).all()
-    
-    return render_template('admin.html',
-                         users=users,
-                         total_users=total_users,
-                         online_users=online_users,
-                         banned_users=banned_users,
-                         total_points=total_points,
-                         recent_videos=recent_videos,
-                         recent_logs=recent_logs)
+    try:
+        # Statistics
+        total_users = User.query.count()
+        online_users = User.query.filter_by(is_online=True).count()
+        banned_users = User.query.filter_by(is_banned=True).count()
+        total_points = db.session.query(func.sum(User.points)).scalar() or 0
+        
+        # Recent videos
+        recent_videos = Video.query.order_by(desc(Video.added_at)).limit(10).all()
+        
+        # Recent logs
+        recent_logs = AdminLog.query.order_by(desc(AdminLog.timestamp)).limit(20).all()
+        
+        # All users for management
+        users = User.query.order_by(desc(User.created_at)).all()
+        
+        return render_template('admin.html',
+                             users=users,
+                             total_users=total_users,
+                             online_users=online_users,
+                             banned_users=banned_users,
+                             total_points=total_points,
+                             recent_videos=recent_videos,
+                             recent_logs=recent_logs)
+    except Exception as e:
+        app.logger.error(f"Error loading admin portal: {e}")
+        flash('Error loading admin dashboard.', 'error')
+        return render_template('admin.html',
+                             users=[],
+                             total_users=0,
+                             online_users=0,
+                             banned_users=0,
+                             total_points=0,
+                             recent_videos=[],
+                             recent_logs=[])
 
 @app.route('/admin/announce', methods=['POST'])
 @login_required
@@ -567,27 +675,33 @@ def toggle_ban(user_id):
         flash('You cannot ban yourself.', 'error')
         return redirect(url_for('admin_portal'))
     
-    user = User.query.get_or_404(user_id)
-    user.is_banned = not user.is_banned
-    user.is_online = False if user.is_banned else user.is_online
+    try:
+        user = User.query.get_or_404(user_id)
+        user.is_banned = not user.is_banned
+        user.is_online = False if user.is_banned else user.is_online
+        
+        # If banning, disconnect user
+        if user.is_banned:
+            socketio.emit('force_logout', {
+                'reason': 'Account suspended by administrator'
+            }, room=user.username)
+        
+        db.session.commit()
+        
+        # Log the action
+        action = 'banned' if user.is_banned else 'unbanned'
+        log_admin_action(
+            action=f'user_{action}',
+            target=user,
+            details=f'User {action}: {user.username}'
+        )
+        
+        flash(f'User {user.username} has been {action}.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error toggling ban for user {user_id}: {e}")
+        flash('Error updating user status.', 'error')
     
-    # If banning, disconnect user
-    if user.is_banned:
-        socketio.emit('force_logout', {
-            'reason': 'Account suspended by administrator'
-        }, room=user.username)
-    
-    db.session.commit()
-    
-    # Log the action
-    action = 'banned' if user.is_banned else 'unbanned'
-    log_admin_action(
-        action=f'user_{action}',
-        target=user,
-        details=f'User {action}: {user.username}'
-    )
-    
-    flash(f'User {user.username} has been {action}.', 'success')
     return redirect(url_for('admin_portal'))
 
 @app.route('/admin/reset_points/<int:user_id>')
@@ -595,27 +709,33 @@ def toggle_ban(user_id):
 @admin_required
 def reset_points(user_id):
     """Reset user points"""
-    user = User.query.get_or_404(user_id)
-    old_points = user.points
-    user.points = 0
-    db.session.commit()
+    try:
+        user = User.query.get_or_404(user_id)
+        old_points = user.points
+        user.points = 0
+        db.session.commit()
+        
+        # Log the action
+        log_admin_action(
+            action='reset_points',
+            target=user,
+            details=f'Reset points from {old_points} to 0'
+        )
+        
+        # Notify user
+        socketio.emit('points_update', {
+            'user_id': user.id,
+            'username': user.username,
+            'points': 0,
+            'points_earned': -old_points
+        }, room=user.username)
+        
+        flash(f'Points reset for {user.username}.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error resetting points for user {user_id}: {e}")
+        flash('Error resetting points.', 'error')
     
-    # Log the action
-    log_admin_action(
-        action='reset_points',
-        target=user,
-        details=f'Reset points from {old_points} to 0'
-    )
-    
-    # Notify user
-    socketio.emit('points_update', {
-        'user_id': user.id,
-        'username': user.username,
-        'points': 0,
-        'points_earned': -old_points
-    }, room=user.username)
-    
-    flash(f'Points reset for {user.username}.', 'success')
     return redirect(url_for('admin_portal'))
 
 @app.route('/admin/add_video', methods=['POST'])
@@ -633,8 +753,7 @@ def add_video():
     
     # Validate URL
     try:
-        from urllib.parse import urlparse
-        result = urlparse(url)
+        result = urlparse.urlparse(url)
         if not all([result.scheme, result.netloc]):
             flash('Invalid URL format.', 'error')
             return redirect(url_for('admin_portal'))
@@ -651,23 +770,29 @@ def add_video():
         is_active=True
     )
     
-    db.session.add(video)
-    db.session.commit()
+    try:
+        db.session.add(video)
+        db.session.commit()
+        
+        # Log the action
+        log_admin_action(
+            action='video_added',
+            details=f'Added video: {title}'
+        )
+        
+        # Notify users
+        socketio.emit('admin_log', {
+            'msg': f'🎬 New education module: {title}',
+            'timestamp': datetime.datetime.utcnow().isoformat(),
+            'type': 'info'
+        }, broadcast=True)
+        
+        flash('Video added successfully!', 'success')
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error adding video: {e}")
+        flash('Error adding video.', 'error')
     
-    # Log the action
-    log_admin_action(
-        action='video_added',
-        details=f'Added video: {title}'
-    )
-    
-    # Notify users
-    socketio.emit('admin_log', {
-        'msg': f'🎬 New education module: {title}',
-        'timestamp': datetime.datetime.utcnow().isoformat(),
-        'type': 'info'
-    }, broadcast=True)
-    
-    flash('Video added successfully!', 'success')
     return redirect(url_for('admin_portal'))
 
 @app.route('/admin/delete_video/<int:video_id>')
@@ -675,18 +800,24 @@ def add_video():
 @admin_required
 def delete_video(video_id):
     """Delete a video"""
-    video = Video.query.get_or_404(video_id)
-    title = video.title
-    db.session.delete(video)
-    db.session.commit()
+    try:
+        video = Video.query.get_or_404(video_id)
+        title = video.title
+        db.session.delete(video)
+        db.session.commit()
+        
+        # Log the action
+        log_admin_action(
+            action='video_deleted',
+            details=f'Deleted video: {title}'
+        )
+        
+        flash(f'Video "{title}" deleted.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error deleting video {video_id}: {e}")
+        flash('Error deleting video.', 'error')
     
-    # Log the action
-    log_admin_action(
-        action='video_deleted',
-        details=f'Deleted video: {title}'
-    )
-    
-    flash(f'Video "{title}" deleted.', 'success')
     return redirect(url_for('admin_portal'))
 
 # --- SocketIO Events ---
@@ -703,7 +834,12 @@ def handle_connect():
         
         # Update user status
         current_user.is_online = True
-        db.session.commit()
+        
+        try:
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            app.logger.error(f"Error updating user status on connect: {e}")
         
         # Notify others
         emit('user_connected', {
@@ -721,7 +857,12 @@ def handle_disconnect():
     if current_user.is_authenticated:
         # Update user status
         current_user.is_online = False
-        db.session.commit()
+        
+        try:
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            app.logger.error(f"Error updating user status on disconnect: {e}")
         
         # Leave rooms
         leave_room(current_user.username)
@@ -756,8 +897,14 @@ def handle_send_message(data):
         user_id=current_user.id,
         room=room
     )
-    db.session.add(message)
-    db.session.commit()
+    
+    try:
+        db.session.add(message)
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error saving message: {e}")
+        return
     
     # Broadcast message
     emit('receive_message', {
@@ -796,8 +943,15 @@ def handle_private_message(data):
         recipient_id=recipient.id,
         room=f'private_{min(current_user.id, recipient.id)}_{max(current_user.id, recipient.id)}'
     )
-    db.session.add(pm)
-    db.session.commit()
+    
+    try:
+        db.session.add(pm)
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error saving private message: {e}")
+        emit('error', {'msg': 'Error sending message'}, room=current_user.username)
+        return
     
     # Send to recipient
     emit('new_private_msg', {
@@ -843,6 +997,9 @@ def handle_update_location(data):
             }, broadcast=True)
     except (ValueError, TypeError) as e:
         app.logger.error(f'Invalid location data: {e}')
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error updating location: {e}")
 
 @socketio.on('admin_push_media')
 def handle_media_push(data):
@@ -858,8 +1015,7 @@ def handle_media_push(data):
     
     # Validate URL
     try:
-        from urllib.parse import urlparse
-        result = urlparse(url)
+        result = urlparse.urlparse(url)
         if not all([result.scheme, result.netloc]):
             emit('error', {'msg': 'Invalid URL format'}, room=current_user.username)
             return
